@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Sistema de Reconhecimento Facial</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+  <div class="app-container">
+    <header>
+      <h1>🛡 Reconhecimento Facial</h1>
+      <p>Registre rostos e verifique o acesso em tempo real</p>
+    </header>
+
+    <main>
+      <!-- ── CÂMERA ── -->
+      <section class="camera-section">
+
+        <!-- Abas: Verificar / Registrar -->
+        <div class="tab-bar">
+          <button class="tab-btn active" id="tab-verify" data-tab="verify">
+            🔍 Verificar Acesso
+          </button>
+          <button class="tab-btn" id="tab-register" data-tab="register">
+            ➕ Registrar Rosto
+          </button>
+        </div>
+
+        <!-- Wrapper do vídeo -->
+        <div class="video-wrapper" id="video-wrapper">
+          <video id="video" autoplay playsinline muted></video>
+          <canvas id="overlay"></canvas>
+
+          <!-- Overlay de resultado (acesso permitido/negado) -->
+          <div id="access-overlay" class="access-overlay hidden"></div>
+
+          <!-- Badge de detecção -->
+          <div id="status-badge" class="status-badge status-idle">
+            ⏸ Câmera desligada
+          </div>
+        </div>
+
+        <!-- Controles da câmera -->
+        <div class="camera-controls">
+          <button id="btn-start" class="btn btn-primary">▶ Iniciar Câmera</button>
+          <button id="btn-stop"  class="btn btn-danger"  disabled>⏹ Parar</button>
+        </div>
+
+        <!-- Painel: Verificar acesso -->
+        <div id="panel-verify" class="mode-panel">
+          <div class="panel-info">
+            <span class="panel-icon">🔍</span>
+            <div>
+              <strong>Modo Verificação</strong>
+              <p>O sistema compara automaticamente o rosto detectado com os cadastros.</p>
+            </div>
+          </div>
+          <button id="btn-check" class="btn btn-primary btn-full" disabled>
+            🔍 Verificar Rosto Agora
+          </button>
+          <div id="verify-result" class="verify-result hidden"></div>
+          <!-- Linha de diagnóstico — mostra a distância calculada -->
+          <div id="debug-info" class="debug-info hidden"></div>
+        </div>
+
+        <!-- Painel: Registrar rosto -->
+        <div id="panel-register" class="mode-panel hidden">
+          <div class="panel-info">
+            <span class="panel-icon">📸</span>
+            <div>
+              <strong>Modo Cadastro</strong>
+              <p>Posicione o rosto e clique em Capturar para salvar um novo cadastro.</p>
+            </div>
+          </div>
+          <button id="btn-capture" class="btn btn-success btn-full" disabled>
+            📸 Capturar Rosto
+          </button>
+        </div>
+
+      </section>
+
+      <!-- ── LISTA DE CADASTROS ── -->
+      <section class="registry-section">
+        <div class="registry-header">
+          <h2>Rostos Cadastrados</h2>
+          <span id="count-badge" class="count-badge">0</span>
+          <button id="btn-clear-all" class="btn btn-sm btn-danger" title="Limpar todos">🗑</button>
+        </div>
+
+        <div id="registry-list" class="registry-list">
+          <div class="empty-state">
+            <span>📭</span>
+            <p>Nenhum rosto cadastrado.</p>
+            <small>Use a aba "Registrar Rosto" para começar.</small>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- ── MODAL DE CONFIRMAÇÃO DE CADASTRO ── -->
+  <div id="modal" class="modal hidden">
+    <div class="modal-content">
+      <h3 id="modal-title">📸 Confirmar Cadastro</h3>
+      <img id="modal-preview" src="" alt="Prévia do rosto" />
+      <div class="modal-info" id="modal-info"></div>
+      <input type="text" id="input-name" placeholder="Nome da pessoa..." maxlength="50" />
+      <div class="modal-actions">
+        <button id="modal-confirm" class="btn btn-success">✔ Salvar</button>
+        <button id="modal-cancel"  class="btn btn-secondary">✖ Cancelar</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── MODAL DE RESULTADO DE VERIFICAÇÃO ── -->
+  <div id="modal-result" class="modal hidden">
+    <div class="modal-content">
+      <div id="result-icon" class="result-icon"></div>
+      <h3 id="result-title"></h3>
+      <img id="result-preview" src="" alt="Rosto verificado" />
+      <div class="modal-info" id="result-info"></div>
+      <div class="modal-actions">
+        <button id="result-close" class="btn btn-secondary">✖ Fechar</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- MediaPipe via CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js" crossorigin="anonymous"></script>
+  <script src="app.js"></script>
+</body>
+</html>
