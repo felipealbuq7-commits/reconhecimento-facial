@@ -1,17 +1,18 @@
 /**
  * app.js — Sistema de Reconhecimento Facial com MediaPipe FaceMesh
  * =================================================================
+ * Persistência: API REST em http://localhost:3001/api/faces  (server.js → db.json)
+ *
  * Como funciona a comparação:
  *   1. Ao cadastrar, os 468 landmarks são normalizados (translação +
- *      escala, usando apenas X e Y — Z é ruidoso) e salvos.
- *   2. Ao verificar, calcula-se a distância euclidiana 2D média
- *      contra cada cadastro.
+ *      escala, usando apenas X e Y — Z é ruidoso) e enviados ao servidor.
+ *   2. Ao verificar, o mesmo processo é feito no rosto atual e
+ *      calcula-se a distância euclidiana 2D média contra cada cadastro.
  *   3. Se a menor distância for ≤ THRESHOLD → Acesso Permitido.
  *
  * Calibração do THRESHOLD:
- *   - Mesmo rosto, variações normais de ângulo/luz: dist ≈ 0.03–0.07
- *   - Rostos diferentes:                            dist ≈ 0.10–0.20+
- *   - Valor seguro: 0.08 (permissivo) a 0.06 (mais estrito)
+ *   Mesmo rosto, variações normais de ângulo/luz : dist ≈ 0.03 – 0.07
+ *   Rostos diferentes                            : dist ≈ 0.10 – 0.20+
  */
 
 'use strict';
@@ -19,9 +20,9 @@
 // ──────────────────────────────────────────────────────────────
 // CONSTANTES
 // ──────────────────────────────────────────────────────────────
-const THRESHOLD   = 0.072;   // distância 2D máxima para "mesmo rosto"
-const LOCK_MS     = 3000;    // tempo (ms) que o resultado fica na tela
-const MAX_RECORDS = 100;     // limite de cadastros
+const API_BASE  = 'http://localhost:3001/api';
+const THRESHOLD = 0.072;
+const LOCK_MS   = 3000;
 
 // ──────────────────────────────────────────────────────────────
 // ELEMENTOS DO DOM
@@ -49,7 +50,6 @@ const debugInfo     = document.getElementById('debug-info');
 const registryList  = document.getElementById('registry-list');
 const countBadge    = document.getElementById('count-badge');
 
-// Modal de cadastro
 const modal         = document.getElementById('modal');
 const modalPreview  = document.getElementById('modal-preview');
 const modalInfo     = document.getElementById('modal-info');
@@ -57,7 +57,6 @@ const inputName     = document.getElementById('input-name');
 const modalConfirm  = document.getElementById('modal-confirm');
 const modalCancel   = document.getElementById('modal-cancel');
 
-// Modal de resultado de verificação
 const modalResult   = document.getElementById('modal-result');
 const resultIcon    = document.getElementById('result-icon');
 const resultTitle   = document.getElementById('result-title');
@@ -68,40 +67,89 @@ const resultClose   = document.getElementById('result-close');
 // ──────────────────────────────────────────────────────────────
 // ESTADO
 // ──────────────────────────────────────────────────────────────
-let faceMesh        = null;
-let camUtil         = null;
-let stream          = null;
-let faceDetected    = false;
-let lastResults     = null;
-let currentMode     = 'verify';   // 'verify' | 'register'
-let locked          = false;      // trava durante exibição de resultado
-let pendingSnap     = null;       // { thumb, fullImg, landmarks }
+let faceMesh     = null;
+let camUtil      = null;
+let stream       = null;
+let faceDetected = false;
+let lastResults  = null;
+let currentMode  = 'verify';
+let locked       = false;
+let pendingSnap  = null;   // { thumb, landmarks }
+let records      = [];     // cache em memória dos cadastros do servidor
 
 // ──────────────────────────────────────────────────────────────
-// REGISTROS — carrega do localStorage
+// INICIALIZAÇÃO — carrega cadastros do servidor
 // ──────────────────────────────────────────────────────────────
-let records = [];
-try {
-  records = JSON.parse(localStorage.getItem('facialRecords') || '[]');
-} catch (_) { records = []; }
+(async function init() {
+  await loadFaces();
+})();
 
-renderRegistry();
+// ──────────────────────────────────────────────────────────────
+// API — funções de comunicação com o servidor
+// ──────────────────────────────────────────────────────────────
+
+/** Busca todos os cadastros e atualiza o cache + lista */
+async function loadFaces() {
+  try {
+    const res  = await fetch(`${API_BASE}/faces`);
+    const data = await res.json();
+    if (data.ok) {
+      records = data.faces;
+      renderRegistry();
+    }
+  } catch (err) {
+    showToast('⚠ Servidor offline. Verifique se node server.js está rodando.', 'warning');
+    console.error('[API] loadFaces:', err);
+  }
+}
+
+/** Envia novo cadastro ao servidor */
+async function apiSaveFace(name, thumb, landmarks) {
+  const res = await fetch(`${API_BASE}/faces`, {
+    method:  'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body:    JSON.stringify({ name, thumb, landmarks }),
+  });
+  const data = await res.json();
+  if (!data.ok) throw new Error(data.error || 'Erro ao salvar.');
+  return data.face;
+}
+
+/** Incrementa contador de verificações */
+async function apiIncrementVerify(id) {
+  try {
+    await fetch(`${API_BASE}/faces/${id}/verify`, { method: 'PATCH' });
+  } catch (_) { /* silencia — não é crítico */ }
+}
+
+/** Remove um cadastro */
+async function apiDeleteFace(id) {
+  const res  = await fetch(`${API_BASE}/faces/${id}`, { method: 'DELETE' });
+  const data = await res.json();
+  if (!data.ok) throw new Error(data.error || 'Erro ao remover.');
+}
+
+/** Remove todos os cadastros */
+async function apiDeleteAll() {
+  const res  = await fetch(`${API_BASE}/faces`, { method: 'DELETE' });
+  const data = await res.json();
+  if (!data.ok) throw new Error(data.error || 'Erro ao limpar.');
+}
 
 // ──────────────────────────────────────────────────────────────
 // ABAS
 // ──────────────────────────────────────────────────────────────
-tabVerify.addEventListener('click', () => switchTab('verify'));
+tabVerify.addEventListener('click',   () => switchTab('verify'));
 tabRegister.addEventListener('click', () => switchTab('register'));
 
 function switchTab(mode) {
   currentMode = mode;
-  tabVerify.classList.toggle('active', mode === 'verify');
+  tabVerify.classList.toggle('active',   mode === 'verify');
   tabRegister.classList.toggle('active', mode === 'register');
-  panelVerify.classList.toggle('hidden', mode !== 'verify');
+  panelVerify.classList.toggle('hidden',   mode !== 'verify');
   panelRegister.classList.toggle('hidden', mode !== 'register');
-
-  // Limpa resultado anterior ao trocar de aba
   verifyResult.classList.add('hidden');
+  if (debugInfo) debugInfo.classList.add('hidden');
   hideAccessOverlay();
 }
 
@@ -113,14 +161,12 @@ function initFaceMesh() {
     locateFile: (file) =>
       `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}`,
   });
-
   faceMesh.setOptions({
     maxNumFaces: 1,
     refineLandmarks: true,
     minDetectionConfidence: 0.55,
-    minTrackingConfidence: 0.55,
+    minTrackingConfidence:  0.55,
   });
-
   faceMesh.onResults(onFaceMeshResults);
 }
 
@@ -130,38 +176,26 @@ function initFaceMesh() {
 function onFaceMeshResults(results) {
   lastResults = results;
 
-  // Sincroniza canvas
   overlay.width  = video.videoWidth  || overlay.offsetWidth;
   overlay.height = video.videoHeight || overlay.offsetHeight;
   ctx.clearRect(0, 0, overlay.width, overlay.height);
 
-  const faces = (results.multiFaceLandmarks || []);
+  const faces = results.multiFaceLandmarks || [];
   faceDetected = faces.length > 0;
 
-  // Cor dos landmarks depende do modo
-  const meshColor = currentMode === 'verify'
-    ? 'rgba(108,99,255,0.22)'
-    : 'rgba(34,197,94,0.22)';
+  const meshColor = currentMode === 'verify' ? 'rgba(108,99,255,0.22)' : 'rgba(34,197,94,0.22)';
   const lineColor = currentMode === 'verify' ? '#6c63ff' : '#22c55e';
 
   faces.forEach((lm) => {
-    drawConnectors(ctx, lm, FACEMESH_TESSELATION,
-      { color: meshColor, lineWidth: 0.5 });
-    drawConnectors(ctx, lm, FACEMESH_FACE_OVAL,
-      { color: lineColor, lineWidth: 2 });
-    drawConnectors(ctx, lm, FACEMESH_LEFT_EYE,
-      { color: '#38bdf8', lineWidth: 1.5 });
-    drawConnectors(ctx, lm, FACEMESH_RIGHT_EYE,
-      { color: '#38bdf8', lineWidth: 1.5 });
-    if (FACEMESH_LEFT_IRIS)
-      drawConnectors(ctx, lm, FACEMESH_LEFT_IRIS,  { color: '#a78bfa', lineWidth: 1.5 });
-    if (FACEMESH_RIGHT_IRIS)
-      drawConnectors(ctx, lm, FACEMESH_RIGHT_IRIS, { color: '#a78bfa', lineWidth: 1.5 });
-    drawConnectors(ctx, lm, FACEMESH_LIPS,
-      { color: '#f472b6', lineWidth: 1.5 });
+    drawConnectors(ctx, lm, FACEMESH_TESSELATION, { color: meshColor, lineWidth: 0.5 });
+    drawConnectors(ctx, lm, FACEMESH_FACE_OVAL,   { color: lineColor, lineWidth: 2 });
+    drawConnectors(ctx, lm, FACEMESH_LEFT_EYE,    { color: '#38bdf8', lineWidth: 1.5 });
+    drawConnectors(ctx, lm, FACEMESH_RIGHT_EYE,   { color: '#38bdf8', lineWidth: 1.5 });
+    if (FACEMESH_LEFT_IRIS)  drawConnectors(ctx, lm, FACEMESH_LEFT_IRIS,  { color: '#a78bfa', lineWidth: 1.5 });
+    if (FACEMESH_RIGHT_IRIS) drawConnectors(ctx, lm, FACEMESH_RIGHT_IRIS, { color: '#a78bfa', lineWidth: 1.5 });
+    drawConnectors(ctx, lm, FACEMESH_LIPS, { color: '#f472b6', lineWidth: 1.5 });
   });
 
-  // Atualiza badge de detecção e botões
   updateStatusBadge(faces.length);
   btnCheck.disabled   = !faceDetected;
   btnCapture.disabled = !faceDetected;
@@ -178,7 +212,7 @@ function updateStatusBadge(count) {
     statusBadge.textContent = '🔍 Procurando rosto...';
   } else {
     statusBadge.classList.add('status-detected');
-    statusBadge.textContent = `✅ Rosto detectado`;
+    statusBadge.textContent = '✅ Rosto detectado';
   }
 }
 
@@ -187,7 +221,7 @@ function updateStatusBadge(count) {
 // ──────────────────────────────────────────────────────────────
 btnStart.addEventListener('click', async () => {
   try {
-    btnStart.disabled = true;
+    btnStart.disabled    = true;
     btnStart.textContent = '⏳ Aguarde...';
 
     stream = await navigator.mediaDevices.getUserMedia({
@@ -212,7 +246,7 @@ btnStart.addEventListener('click', async () => {
     statusBadge.textContent = '🔍 Procurando rosto...';
 
   } catch (err) {
-    btnStart.disabled = false;
+    btnStart.disabled    = false;
     btnStart.textContent = '▶ Iniciar Câmera';
     showToast('❌ Câmera: ' + err.message, 'error');
   }
@@ -231,13 +265,13 @@ function stopCamera() {
   faceDetected = false;
 
   btnStart.classList.remove('hidden');
-  btnStart.disabled = false;
+  btnStart.disabled    = false;
   btnStart.textContent = '▶ Iniciar Câmera';
-  btnStop.disabled = true;
-  btnCheck.disabled = true;
-  btnCapture.disabled = true;
+  btnStop.disabled     = true;
+  btnCheck.disabled    = true;
+  btnCapture.disabled  = true;
 
-  statusBadge.className = 'status-badge status-idle';
+  statusBadge.className   = 'status-badge status-idle';
   statusBadge.textContent = '⏸ Câmera desligada';
   hideAccessOverlay();
   verifyResult.classList.add('hidden');
@@ -252,17 +286,19 @@ btnCheck.addEventListener('click', () => {
   const currentLM = lastResults?.multiFaceLandmarks?.[0];
   if (!currentLM) return;
 
-  // Captura thumb para exibição
-  const snap   = captureFrame();
-  const thumb  = cropFace(snap, currentLM);
+  const snap  = captureFrame();
+  const thumb = cropFace(snap, currentLM);
 
-  // Compara com cada cadastro
   const { match, dist } = findBestMatch(normalizeLandmarks(currentLM));
 
-  // Mostra diagnóstico
   showDebug(dist, match);
 
   if (match) {
+    // Incrementa contador no servidor (assíncrono, não bloqueia)
+    apiIncrementVerify(match.id).then(() => {
+      const rec = records.find(r => r.id === match.id);
+      if (rec) { rec.verifyCount = (rec.verifyCount || 0) + 1; renderRegistry(); }
+    });
     showResult('allowed', match, thumb);
   } else {
     showResult('denied', null, thumb);
@@ -270,19 +306,15 @@ btnCheck.addEventListener('click', () => {
 });
 
 // ──────────────────────────────────────────────────────────────
-// MOSTRAR RESULTADO DE VERIFICAÇÃO
+// MOSTRAR RESULTADO
 // ──────────────────────────────────────────────────────────────
 function showResult(type, matchRecord, thumbDataUrl) {
   locked = true;
 
-  // Overlay na câmera
   showAccessOverlay(type, matchRecord);
-
-  // Borda do wrapper
   videoWrapper.classList.remove('allowed', 'denied');
   videoWrapper.classList.add(type);
 
-  // Painel inline
   verifyResult.className = `verify-result ${type}`;
   verifyResult.classList.remove('hidden');
 
@@ -302,27 +334,23 @@ function showResult(type, matchRecord, thumbDataUrl) {
       </div>`;
   }
 
-  // Modal com detalhes
   resultPreview.src = thumbDataUrl;
   if (type === 'allowed') {
     resultIcon.textContent  = '✅';
     resultTitle.textContent = 'ACESSO PERMITIDO';
     resultTitle.style.color = '#4ade80';
-    resultInfo.innerHTML    = `
-      Bem-vindo(a), <strong>${escapeHtml(matchRecord.name)}</strong>!<br/>
-      Cadastrado em: ${formatDate(matchRecord.timestamp)}
-    `;
+    resultInfo.innerHTML    = `Bem-vindo(a), <strong>${escapeHtml(matchRecord.name)}</strong>!<br/>
+      Cadastrado em: ${formatDate(matchRecord.timestamp)}`;
     resultPreview.style.borderColor = 'var(--success)';
   } else {
     resultIcon.textContent  = '🚫';
     resultTitle.textContent = 'ACESSO NEGADO';
     resultTitle.style.color = '#f87171';
-    resultInfo.innerHTML    = `Rosto <strong>não encontrado</strong> no banco de cadastros.<br/>Solicite o cadastro ao administrador.`;
+    resultInfo.innerHTML    = `Rosto <strong>não encontrado</strong> no banco de dados.<br/>Solicite o cadastro ao administrador.`;
     resultPreview.style.borderColor = 'var(--danger)';
   }
   modalResult.classList.remove('hidden');
 
-  // Libera o lock após LOCK_MS
   setTimeout(() => {
     locked = false;
     hideAccessOverlay();
@@ -331,24 +359,21 @@ function showResult(type, matchRecord, thumbDataUrl) {
 }
 
 // ──────────────────────────────────────────────────────────────
-// OVERLAY NA CÂMERA
+// OVERLAYS
 // ──────────────────────────────────────────────────────────────
 function showAccessOverlay(type, matchRecord) {
   accessOverlay.className = `access-overlay ${type}`;
   accessOverlay.classList.remove('hidden');
-
   if (type === 'allowed') {
     accessOverlay.innerHTML = `
       <span class="access-emoji">✅</span>
       <span class="access-label">ACESSO PERMITIDO</span>
-      <span class="access-name">👤 ${escapeHtml(matchRecord.name)}</span>
-    `;
+      <span class="access-name">👤 ${escapeHtml(matchRecord.name)}</span>`;
   } else {
     accessOverlay.innerHTML = `
       <span class="access-emoji">🚫</span>
       <span class="access-label">ACESSO NEGADO</span>
-      <span class="access-name">Rosto não cadastrado</span>
-    `;
+      <span class="access-name">Rosto não cadastrado</span>`;
   }
 }
 
@@ -357,7 +382,6 @@ function hideAccessOverlay() {
   accessOverlay.className = 'access-overlay hidden';
 }
 
-// Fecha modal de resultado
 resultClose.addEventListener('click', () => modalResult.classList.add('hidden'));
 modalResult.addEventListener('click', (e) => {
   if (e.target === modalResult) modalResult.classList.add('hidden');
@@ -368,53 +392,45 @@ modalResult.addEventListener('click', (e) => {
 // ──────────────────────────────────────────────────────────────
 btnCapture.addEventListener('click', () => {
   if (!faceDetected) return;
-
   const currentLM = lastResults?.multiFaceLandmarks?.[0];
   if (!currentLM) return;
 
-  const snap     = captureFrame();
-  const thumb    = cropFace(snap, currentLM);
-  const normLM   = normalizeLandmarks(currentLM);
+  const snap   = captureFrame();
+  const thumb  = cropFace(snap, currentLM);
+  const normLM = normalizeLandmarks(currentLM);
 
-  pendingSnap = {
-    thumb,
-    fullImg: snap.toDataURL('image/jpeg', 0.9),
-    landmarks: normLM,
-  };
+  pendingSnap = { thumb, landmarks: Array.from(normLM) };
 
-  // Pré-preenche modal
-  modalPreview.src    = thumb;
-  modalInfo.textContent = `${new Date().toLocaleString('pt-BR')}`;
-  inputName.value     = '';
+  modalPreview.src      = thumb;
+  modalInfo.textContent = new Date().toLocaleString('pt-BR');
+  inputName.value       = '';
   modal.classList.remove('hidden');
   setTimeout(() => inputName.focus(), 80);
 });
 
 // ──────────────────────────────────────────────────────────────
-// CONFIRMAR CADASTRO
+// CONFIRMAR CADASTRO → SALVA NO SERVIDOR (db.json)
 // ──────────────────────────────────────────────────────────────
-modalConfirm.addEventListener('click', () => {
+modalConfirm.addEventListener('click', async () => {
   const name = (inputName.value || '').trim() || 'Anônimo';
   if (!pendingSnap) return;
 
-  const record = {
-    id:        Date.now(),
-    name,
-    thumb:     pendingSnap.thumb,
-    fullImg:   pendingSnap.fullImg,
-    landmarks: pendingSnap.landmarks,
-    timestamp: new Date().toISOString(),
-    verifyCount: 0,
-  };
+  modalConfirm.disabled    = true;
+  modalConfirm.textContent = '⏳ Salvando...';
 
-  records.unshift(record);
-  if (records.length > MAX_RECORDS) records.pop(); // mantém limite
-  persistRecords();
-  renderRegistry();
-
-  modal.classList.add('hidden');
-  pendingSnap = null;
-  showToast(`✅ "${name}" cadastrado com sucesso!`);
+  try {
+    const saved = await apiSaveFace(name, pendingSnap.thumb, pendingSnap.landmarks);
+    records.unshift(saved);
+    renderRegistry();
+    modal.classList.add('hidden');
+    pendingSnap = null;
+    showToast(`✅ "${name}" cadastrado e salvo no banco de dados!`);
+  } catch (err) {
+    showToast('❌ Erro ao salvar: ' + err.message, 'error');
+  } finally {
+    modalConfirm.disabled    = false;
+    modalConfirm.textContent = '✔ Salvar';
+  }
 });
 
 modalCancel.addEventListener('click', () => {
@@ -438,16 +454,15 @@ function captureFrame() {
   const snap    = document.createElement('canvas');
   snap.width    = video.videoWidth;
   snap.height   = video.videoHeight;
-  const snapCtx = snap.getContext('2d');
-  // Des-espelha a imagem capturada
-  snapCtx.translate(snap.width, 0);
-  snapCtx.scale(-1, 1);
-  snapCtx.drawImage(video, 0, 0);
+  const sCtx    = snap.getContext('2d');
+  sCtx.translate(snap.width, 0);
+  sCtx.scale(-1, 1);
+  sCtx.drawImage(video, 0, 0);
   return snap;
 }
 
 // ──────────────────────────────────────────────────────────────
-// RECORTAR ROSTO DO CANVAS
+// RECORTAR ROSTO
 // ──────────────────────────────────────────────────────────────
 function cropFace(sourceCanvas, landmarks) {
   if (!landmarks || landmarks.length === 0)
@@ -455,11 +470,10 @@ function cropFace(sourceCanvas, landmarks) {
 
   const W = sourceCanvas.width;
   const H = sourceCanvas.height;
-
-  // Nota: como des-espelhamos o canvas, precisamos inverter X
   let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+
   landmarks.forEach(({ x, y }) => {
-    const rx = (1 - x) * W; // inverte X (des-espelhado)
+    const rx = (1 - x) * W;
     const ry = y * H;
     if (rx < minX) minX = rx;
     if (ry < minY) minY = ry;
@@ -467,43 +481,35 @@ function cropFace(sourceCanvas, landmarks) {
     if (ry > maxY) maxY = ry;
   });
 
-  const padX = (maxX - minX) * 0.28;
-  const padY = (maxY - minY) * 0.28;
   const cx   = (minX + maxX) / 2;
   const cy   = (minY + maxY) / 2;
-  const size = Math.max((maxX - minX) + padX * 2, (maxY - minY) + padY * 2);
+  const size = Math.max((maxX - minX) * 1.56, (maxY - minY) * 1.56);
   const sx   = Math.max(0, cx - size / 2);
   const sy   = Math.max(0, cy - size / 2);
   const sw   = Math.min(W - sx, size);
   const sh   = Math.min(H - sy, size);
 
-  const thumb    = document.createElement('canvas');
-  thumb.width    = 200;
-  thumb.height   = 200;
+  const thumb  = document.createElement('canvas');
+  thumb.width  = 200;
+  thumb.height = 200;
   thumb.getContext('2d').drawImage(sourceCanvas, sx, sy, sw, sh, 0, 0, 200, 200);
   return thumb.toDataURL('image/jpeg', 0.88);
 }
 
 // ──────────────────────────────────────────────────────────────
-// NORMALIZAR LANDMARKS  (apenas X e Y — Z é ruidoso no FaceMesh)
-//  Retorna array plano [x0,y0, x1,y1, …] normalizado:
-//  - translação: subtrai centróide 2D
-//  - escala: distância média dos pontos ao centróide
+// NORMALIZAR LANDMARKS (X e Y apenas — Z é ruidoso)
 // ──────────────────────────────────────────────────────────────
 function normalizeLandmarks(landmarks) {
   const n = landmarks.length;
   let cx = 0, cy = 0;
-
   for (const { x, y } of landmarks) { cx += x; cy += y; }
   cx /= n; cy /= n;
 
   let scale = 0;
-  for (const { x, y } of landmarks) {
+  for (const { x, y } of landmarks)
     scale += Math.sqrt((x - cx) ** 2 + (y - cy) ** 2);
-  }
   scale = (scale / n) || 1;
 
-  // Array plano 2D
   const out = new Float32Array(n * 2);
   landmarks.forEach(({ x, y }, i) => {
     out[i * 2]     = (x - cx) / scale;
@@ -513,15 +519,14 @@ function normalizeLandmarks(landmarks) {
 }
 
 // ──────────────────────────────────────────────────────────────
-// COMPARAR DOIS VETORES 2D DE LANDMARKS
-//  Retorna distância euclidiana média por ponto (0 = idêntico)
+// COMPARAR DOIS VETORES 2D (distância euclidiana média)
 // ──────────────────────────────────────────────────────────────
 function compareLandmarks(a, b) {
   if (a.length !== b.length) return Infinity;
   const n = a.length / 2;
   let sum = 0;
   for (let i = 0; i < a.length; i += 2) {
-    const dx = a[i]     - b[i];
+    const dx = a[i] - b[i];
     const dy = a[i + 1] - b[i + 1];
     sum += Math.sqrt(dx * dx + dy * dy);
   }
@@ -529,8 +534,7 @@ function compareLandmarks(a, b) {
 }
 
 // ──────────────────────────────────────────────────────────────
-// ENCONTRAR MELHOR MATCH NA BASE DE CADASTROS
-// Retorna { match: record|null, dist: number }
+// ENCONTRAR MELHOR MATCH (contra cache em memória)
 // ──────────────────────────────────────────────────────────────
 function findBestMatch(normLM) {
   if (records.length === 0) return { match: null, dist: Infinity };
@@ -541,81 +545,49 @@ function findBestMatch(normLM) {
   for (const rec of records) {
     if (!rec.landmarks || rec.landmarks.length === 0) continue;
 
-    // Após persistência, landmarks vem como Array JS normal (JSON não tem Float32Array).
-    // Garante Float32Array independente do formato salvo.
-    let stored;
-    if (rec.landmarks instanceof Float32Array) {
-      stored = rec.landmarks;
-    } else if (Array.isArray(rec.landmarks)) {
-      stored = new Float32Array(rec.landmarks);
-    } else {
-      // fallback para objeto com chaves numéricas (nunca deveria ocorrer)
-      stored = new Float32Array(Object.keys(rec.landmarks).sort((a,b)=>a-b).map(k => rec.landmarks[k]));
-    }
+    // Converte array JSON → Float32Array para cálculo
+    const stored = new Float32Array(rec.landmarks);
 
-    // Tamanhos incompatíveis — registro antigo com Z (3 coords) vs novo (2 coords)
-    // Nesse caso pula em vez de retornar Infinity
     if (stored.length !== normLM.length) {
-      console.warn(`[FaceMatch] Cadastro "${rec.name}" tem ${stored.length} coords, esperado ${normLM.length}. Recadastre.`);
+      console.warn(`[Match] "${rec.name}": ${stored.length} coords ≠ ${normLM.length}. Recadastre.`);
       continue;
     }
 
     const dist = compareLandmarks(normLM, stored);
-    if (dist < bestDist) {
-      bestDist   = dist;
-      bestRecord = rec;
-    }
+    if (dist < bestDist) { bestDist = dist; bestRecord = rec; }
   }
 
-  console.debug(`[FaceMatch] melhor dist=${bestDist.toFixed(5)}  threshold=${THRESHOLD}  pessoa="${bestRecord?.name}"`);
+  console.debug(`[Match] dist=${bestDist.toFixed(5)} | threshold=${THRESHOLD} | pessoa="${bestRecord?.name}"`);
 
-  if (bestDist <= THRESHOLD) {
-    bestRecord.verifyCount = (bestRecord.verifyCount || 0) + 1;
-    persistRecords();
-    renderRegistry();
-    return { match: bestRecord, dist: bestDist };
-  }
-  return { match: null, dist: bestDist };
+  return bestDist <= THRESHOLD
+    ? { match: bestRecord, dist: bestDist }
+    : { match: null,       dist: bestDist };
 }
 
 // ──────────────────────────────────────────────────────────────
-// DIAGNÓSTICO — mostra a distância calculada ao usuário
+// DIAGNÓSTICO
 // ──────────────────────────────────────────────────────────────
 function showDebug(dist, matchRecord) {
   if (!debugInfo) return;
-  const isFinite_ = isFinite(dist);
-  const pct       = isFinite_ ? Math.min(100, (dist / 0.20) * 100) : 100;
-  const color     = dist <= THRESHOLD ? '#22c55e'
-                  : dist <= THRESHOLD * 1.5 ? '#f59e0b'
-                  : '#ef4444';
-  const label     = matchRecord ? `"${escapeHtml(matchRecord.name)}"` : 'nenhum';
+  const finite = isFinite(dist);
+  const pct    = finite ? Math.min(100, (dist / 0.20) * 100) : 100;
+  const color  = dist <= THRESHOLD         ? '#22c55e'
+               : dist <= THRESHOLD * 1.5   ? '#f59e0b'
+               :                             '#ef4444';
+  const label  = matchRecord ? `"${escapeHtml(matchRecord.name)}"` : 'nenhum';
 
   debugInfo.classList.remove('hidden');
   debugInfo.innerHTML = `
-    Distância: <strong>${isFinite_ ? dist.toFixed(5) : '∞'}</strong>
+    Distância: <strong>${finite ? dist.toFixed(5) : '∞'}</strong>
     &nbsp;|&nbsp; Limite: ${THRESHOLD}
     &nbsp;|&nbsp; Mais próximo: ${label}
-    <div class="dist-bar">
-      <div class="dist-fill" style="width:${pct}%;background:${color}"></div>
-    </div>
+    <div class="dist-bar"><div class="dist-fill" style="width:${pct}%;background:${color}"></div></div>
   `;
 }
 
-
-function persistRecords() {
-  try {
-    // Float32Array não serializa direto — converte para Array normal
-    const toSave = records.map(r => ({
-      ...r,
-      landmarks: r.landmarks ? Array.from(r.landmarks) : [],
-    }));
-    localStorage.setItem('facialRecords', JSON.stringify(toSave));
-  } catch (e) {
-    console.warn('localStorage cheio:', e);
-    showToast('⚠ Armazenamento cheio. Exclua cadastros antigos.', 'warning');
-  }
-}
-
+// ──────────────────────────────────────────────────────────────
+// RENDERIZAR LISTA
+// ──────────────────────────────────────────────────────────────
 function renderRegistry() {
   countBadge.textContent = records.length;
 
@@ -631,21 +603,15 @@ function renderRegistry() {
 
   registryList.innerHTML = records.map((r) => `
     <div class="face-card" data-id="${r.id}">
-      <img
-        class="face-thumb"
-        src="${r.thumb}"
-        alt="${escapeHtml(r.name)}"
-        title="Ver foto"
-        onclick="viewRecord(${r.id})"
-      />
+      <img class="face-thumb" src="${r.thumb || ''}" alt="${escapeHtml(r.name)}"
+           onclick="viewRecord(${r.id})" title="Ver detalhes" />
       <div class="face-info">
         <div class="face-name">${escapeHtml(r.name)}</div>
         <div class="face-time">📅 ${formatDate(r.timestamp)}</div>
         <div class="face-count">🔓 ${r.verifyCount || 0} verificação(ões)</div>
       </div>
       <div class="face-actions">
-        <button class="btn-icon" title="Download" onclick="downloadRecord(${r.id})">⬇</button>
-        <button class="btn-icon" title="Remover"  onclick="deleteRecord(${r.id})">🗑</button>
+        <button class="btn-icon" title="Remover" onclick="deleteRecord(${r.id})">🗑</button>
       </div>
     </div>
   `).join('');
@@ -654,16 +620,21 @@ function renderRegistry() {
 // ──────────────────────────────────────────────────────────────
 // LIMPAR TODOS
 // ──────────────────────────────────────────────────────────────
-btnClearAll.addEventListener('click', () => {
+btnClearAll.addEventListener('click', async () => {
   if (records.length === 0) return;
-  if (!confirm(`Remover todos os ${records.length} cadastro(s)?`)) return;
-  records = [];
-  persistRecords();
-  renderRegistry();
+  if (!confirm(`Remover todos os ${records.length} cadastro(s) do banco de dados?`)) return;
+  try {
+    await apiDeleteAll();
+    records = [];
+    renderRegistry();
+    showToast('🗑 Todos os cadastros foram removidos.');
+  } catch (err) {
+    showToast('❌ ' + err.message, 'error');
+  }
 });
 
 // ──────────────────────────────────────────────────────────────
-// VER / DOWNLOAD / DELETAR REGISTRO
+// VER / DELETAR CADASTRO
 // ──────────────────────────────────────────────────────────────
 function viewRecord(id) {
   const r = records.find(x => x.id === id);
@@ -671,29 +642,26 @@ function viewRecord(id) {
   resultIcon.textContent  = '👤';
   resultTitle.textContent = escapeHtml(r.name);
   resultTitle.style.color = 'var(--text)';
-  resultPreview.src       = r.thumb;
+  resultPreview.src       = r.thumb || '';
   resultPreview.style.borderColor = 'var(--primary)';
   resultInfo.innerHTML    = `
     Cadastrado em: ${formatDate(r.timestamp)}<br/>
-    Verificações: ${r.verifyCount || 0}
+    Verificações: <strong>${r.verifyCount || 0}</strong><br/>
+    Landmarks: <strong>${r.landmarks?.length || 0}</strong> valores
   `;
   modalResult.classList.remove('hidden');
 }
 
-function downloadRecord(id) {
-  const r = records.find(x => x.id === id);
-  if (!r) return;
-  const a    = document.createElement('a');
-  a.href     = r.fullImg || r.thumb;
-  a.download = `${r.name.replace(/\s+/g, '_')}_${r.id}.jpg`;
-  a.click();
-}
-
-function deleteRecord(id) {
-  if (!confirm('Remover este cadastro?')) return;
-  records = records.filter(x => x.id !== id);
-  persistRecords();
-  renderRegistry();
+async function deleteRecord(id) {
+  if (!confirm('Remover este cadastro do banco de dados?')) return;
+  try {
+    await apiDeleteFace(id);
+    records = records.filter(x => x.id !== id);
+    renderRegistry();
+    showToast('🗑 Cadastro removido.');
+  } catch (err) {
+    showToast('❌ ' + err.message, 'error');
+  }
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -719,21 +687,16 @@ function showToast(message, type = 'success') {
   toast.textContent = message;
   const colors = { success:'#22c55e', error:'#ef4444', warning:'#f59e0b' };
   toast.style.cssText = `
-    position:fixed; bottom:28px; left:50%;
-    transform:translateX(-50%);
-    background:${colors[type]||colors.success};
-    color:#fff; padding:12px 24px;
-    border-radius:999px; font-weight:600; font-size:0.88rem;
-    box-shadow:0 4px 20px rgba(0,0,0,.4);
-    z-index:9999; white-space:nowrap; max-width:90vw;
+    position:fixed;bottom:28px;left:50%;transform:translateX(-50%);
+    background:${colors[type]||colors.success};color:#fff;
+    padding:12px 24px;border-radius:999px;font-weight:600;font-size:.88rem;
+    box-shadow:0 4px 20px rgba(0,0,0,.4);z-index:9999;
+    white-space:nowrap;max-width:90vw;
   `;
   document.body.appendChild(toast);
   setTimeout(() => toast.remove(), 3200);
 }
 
-// ──────────────────────────────────────────────────────────────
-// Expõe funções usadas em handlers inline
-// ──────────────────────────────────────────────────────────────
-window.viewRecord     = viewRecord;
-window.downloadRecord = downloadRecord;
-window.deleteRecord   = deleteRecord;
+// Expõe para handlers inline
+window.viewRecord   = viewRecord;
+window.deleteRecord = deleteRecord;
